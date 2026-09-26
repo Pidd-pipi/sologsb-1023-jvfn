@@ -5,6 +5,7 @@ import type {
   ComparisonRules,
   DifferenceStatus,
   PersistedCollationState,
+  ReviewRecord,
   TextUnit,
   VersionDocument
 } from '../types';
@@ -170,11 +171,70 @@ function defaultRules(): ComparisonRules {
   return { ignorePunctuation: true, ignoreVariants: true, candidateWindow: 3 };
 }
 
+function pairKeyOf(left: TextUnit | undefined, right: TextUnit | undefined) {
+  return `${left?.text ?? ''}\u0001${right?.text ?? ''}`;
+}
+
+function hasManualWork(row: AlignmentRow) {
+  return Boolean(row.note.trim() || row.source.trim() || (row.accepted && row.status !== 'same'));
+}
+
+function reviewKeyOf(record: Pick<ReviewRecord, 'left' | 'right' | 'note' | 'source'>) {
+  return `${pairKeyOf(record.left, record.right)}\u0001${record.note}\u0001${record.source}`;
+}
+
+function carryManualWork(oldRows: AlignmentRow[], newRows: AlignmentRow[]) {
+  const sources = oldRows.filter(hasManualWork);
+  if (!sources.length) return { carried: 0, orphans: [] as ReviewRecord[] };
+
+  const countBy = (items: { key: string }[]) => {
+    const counts = new Map<string, number>();
+    for (const item of items) counts.set(item.key, (counts.get(item.key) ?? 0) + 1);
+    return counts;
+  };
+  const newKeyed = newRows.map((row) => ({ key: pairKeyOf(row.left, row.right), row }));
+  const sourceKeyed = sources.map((row) => ({ key: pairKeyOf(row.left, row.right), row }));
+  const newCounts = countBy(newKeyed);
+  const sourceCounts = countBy(sourceKeyed);
+  const uniqueNewByKey = new Map<string, AlignmentRow>();
+  for (const { key, row } of newKeyed) {
+    if (newCounts.get(key) === 1) uniqueNewByKey.set(key, row);
+  }
+
+  let carried = 0;
+  const orphans: ReviewRecord[] = [];
+  const stamp = Date.now().toString(36);
+  for (const { key, row } of sourceKeyed) {
+    const target = sourceCounts.get(key) === 1 ? uniqueNewByKey.get(key) : undefined;
+    if (target) {
+      target.note = row.note;
+      target.source = row.source;
+      target.accepted = row.accepted;
+      target.manuallyAdjusted = true;
+      carried += 1;
+    } else {
+      orphans.push({
+        id: `review-${stamp}-${orphans.length + 1}`,
+        left: row.left,
+        right: row.right,
+        status: row.status,
+        similarity: row.similarity,
+        note: row.note,
+        source: row.source,
+        accepted: row.accepted,
+        createdAt: new Date().toISOString()
+      });
+    }
+  }
+  return { carried, orphans };
+}
+
 export function useCollation() {
   const versions = ref<VersionDocument[]>(clone(sampleVersions));
   const leftVersionId = ref(versions.value[0].id);
   const rightVersionId = ref(versions.value[1].id);
   const rows = ref<AlignmentRow[]>([]);
+  const reviewRecords = ref<ReviewRecord[]>([]);
   const rules = ref<ComparisonRules>(defaultRules());
   const selectedRowId = ref('');
   const selectedRowIds = ref<(string | number)[]>([]);
@@ -191,6 +251,10 @@ export function useCollation() {
   const differenceCount = computed(() => rows.value.filter((row) => row.status !== 'same').length);
   const acceptedCount = computed(() => rows.value.filter((row) => row.accepted).length);
   const unresolvedCount = computed(() => rows.value.filter((row) => !row.accepted && row.status !== 'same').length);
+  const reviewCount = computed(() => reviewRecords.value.length);
+  const notedPendingCount = computed(
+    () => rows.value.filter((row) => row.status !== 'same' && !row.accepted && row.note.trim()).length
+  );
 
   function snapshot(): string {
     const data: PersistedCollationState = {
@@ -199,7 +263,8 @@ export function useCollation() {
       rightVersionId: rightVersionId.value,
       rows: rows.value,
       rules: rules.value,
-      selectedRowId: selectedRowId.value
+      selectedRowId: selectedRowId.value,
+      pendingReview: reviewRecords.value
     };
     return JSON.stringify(data);
   }
@@ -225,6 +290,7 @@ export function useCollation() {
     rows.value = parsed.rows;
     rules.value = parsed.rules;
     selectedRowId.value = parsed.selectedRowId;
+    reviewRecords.value = parsed.pendingReview ?? [];
     persist();
   }
 
@@ -258,10 +324,21 @@ export function useCollation() {
         history.value.push(previous);
         future.value = [];
       }
+      const { carried, orphans } = carryManualWork(rows.value, result);
+      const known = new Set(reviewRecords.value.map(reviewKeyOf));
+      const fresh = orphans.filter((record) => {
+        if (known.has(reviewKeyOf(record))) return false;
+        known.add(reviewKeyOf(record));
+        return true;
+      });
       rows.value = result;
+      reviewRecords.value = [...reviewRecords.value, ...fresh];
       selectedRowId.value = result.find((row) => row.status !== 'same')?.id ?? result[0]?.id ?? '';
       selectedRowIds.value = [];
-      message.value = `自动对齐完成：${result.filter((row) => row.status !== 'same').length} 处差异`;
+      const parts = [`自动对齐完成：${result.filter((row) => row.status !== 'same').length} 处差异`];
+      if (carried) parts.push(`已带回 ${carried} 条人工校勘`);
+      if (fresh.length) parts.push(`${fresh.length} 条旧校勘无法唯一对应，已转入待复核区`);
+      message.value = parts.join('；');
       persist();
     } finally {
       processing.value = false;
@@ -336,11 +413,65 @@ export function useCollation() {
   }
 
   function acceptAll() {
-    commit('已批量接受全部差异建议', () => {
+    const ids = rows.value
+      .filter((row) => row.status !== 'same' && !row.accepted && row.note.trim())
+      .map((row) => row.id);
+    if (!ids.length) return;
+    commit(`已批量接受 ${ids.length} 条已填说明的改动`, () => {
+      const selected = new Set(ids);
       rows.value.forEach((row) => {
-        row.accepted = true;
+        if (selected.has(row.id)) row.accepted = true;
       });
       selectedRowIds.value = [];
+    });
+  }
+
+  function keepReviewRecord(id: string) {
+    if (!reviewRecords.value.some((record) => record.id === id)) return;
+    commit('已把一条待复核校勘保留回对齐表', () => {
+      const index = reviewRecords.value.findIndex((record) => record.id === id);
+      const [record] = reviewRecords.value.splice(index, 1);
+      const row: AlignmentRow = {
+        id: `row-kept-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        left: record.left,
+        right: record.right,
+        status: record.status,
+        similarity: record.similarity,
+        note: record.note,
+        source: record.source,
+        accepted: record.accepted,
+        manuallyAdjusted: true
+      };
+      const leftOrder = record.left?.sentenceOrder;
+      const rightOrder = record.right?.sentenceOrder;
+      let insertAt = rows.value.length;
+      for (let i = 0; i < rows.value.length; i += 1) {
+        const current = rows.value[i];
+        if (leftOrder != null && current.left && current.left.sentenceOrder > leftOrder) {
+          insertAt = i;
+          break;
+        }
+        if (leftOrder == null && rightOrder != null && current.right && current.right.sentenceOrder > rightOrder) {
+          insertAt = i;
+          break;
+        }
+      }
+      rows.value.splice(insertAt, 0, row);
+      selectedRowId.value = row.id;
+    });
+  }
+
+  function discardReviewRecord(id: string) {
+    if (!reviewRecords.value.some((record) => record.id === id)) return;
+    commit('已放弃一条待复核校勘', () => {
+      reviewRecords.value = reviewRecords.value.filter((record) => record.id !== id);
+    });
+  }
+
+  function clearReviewRecords() {
+    if (!reviewRecords.value.length) return;
+    commit(`已清空待复核区（${reviewRecords.value.length} 条）`, () => {
+      reviewRecords.value = [];
     });
   }
 
@@ -441,6 +572,7 @@ export function useCollation() {
     leftVersionId,
     rightVersionId,
     rows,
+    reviewRecords,
     rules,
     selectedRowId,
     selectedRowIds,
@@ -457,6 +589,8 @@ export function useCollation() {
     differenceCount,
     acceptedCount,
     unresolvedCount,
+    reviewCount,
+    notedPendingCount,
     runAlignment,
     recalculate,
     updateRow,
@@ -464,6 +598,9 @@ export function useCollation() {
     moveRow,
     acceptRows,
     acceptAll,
+    keepReviewRecord,
+    discardReviewRecord,
+    clearReviewRecords,
     nextDifference,
     addVersion,
     undo,

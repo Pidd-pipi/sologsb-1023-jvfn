@@ -208,6 +208,20 @@ textarea {
   background: #f7f8fa;
 }
 
+.review-card {
+  margin-bottom: 12px;
+  border-radius: 10px;
+}
+
+.review-text-block {
+  margin-top: 8px;
+}
+
+.review-text-block .diff-text {
+  min-height: 0;
+  font-size: 14px;
+}
+
 @media (max-width: 1100px) {
   .main-layout {
     display: block !important;

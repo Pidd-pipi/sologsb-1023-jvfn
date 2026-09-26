@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { Message } from '@arco-design/web-vue';
+import { Message, Modal } from '@arco-design/web-vue';
 import { statusLabel, useCollation } from './composables/useCollation';
 import type { AlignmentRow, DifferenceStatus } from './types';
 
@@ -9,6 +9,7 @@ const {
   leftVersionId,
   rightVersionId,
   rows,
+  reviewRecords,
   rules,
   selectedRowId,
   selectedRowIds,
@@ -21,6 +22,8 @@ const {
   differenceCount,
   acceptedCount,
   unresolvedCount,
+  reviewCount,
+  notedPendingCount,
   runAlignment,
   recalculate,
   updateRow,
@@ -28,16 +31,19 @@ const {
   moveRow,
   acceptRows,
   acceptAll,
+  keepReviewRecord,
+  discardReviewRecord,
+  clearReviewRecords,
   nextDifference,
   addVersion,
   undo,
   redo,
   exportMarkdown,
-  exportJson,
-  commit
+  exportJson
 } = useCollation();
 
 const importVisible = ref(false);
+const reviewVisible = ref(false);
 const onlyDifferences = ref(false);
 const rowQuery = ref('');
 const noteDraft = ref('');
@@ -79,6 +85,10 @@ watch(
   },
   { immediate: true }
 );
+
+watch(reviewCount, (count, previous) => {
+  if (count > (previous ?? 0)) reviewVisible.value = true;
+});
 
 function statusColor(status: DifferenceStatus) {
   return {
@@ -127,11 +137,26 @@ function download(filename: string, text: string, type: string) {
 }
 
 function handleExport(kind: 'markdown' | 'json') {
+  if (reviewCount.value > 0) {
+    reviewVisible.value = true;
+    Message.warning(`还有 ${reviewCount.value} 条待复核记录，请逐条确认保留或放弃，处理完后再导出`);
+    return;
+  }
   if (kind === 'markdown') {
     download('校勘记.md', exportMarkdown(), 'text/markdown;charset=utf-8');
   } else {
     download('校勘数据.json', exportJson(), 'application/json;charset=utf-8');
   }
+}
+
+function confirmAcceptAll() {
+  Modal.confirm({
+    title: '批量接受前请再次确认',
+    content: `将接受 ${notedPendingCount.value} 条已填写校勘说明的改动，未填写说明的差异保持不变。接受后这些条目会从未处理清单中清空，确认继续？`,
+    okText: '确认接受',
+    cancelText: '再检查一下',
+    onOk: () => acceptAll()
+  });
 }
 
 function openImport() {
@@ -185,7 +210,7 @@ function handleKeydown(event: KeyboardEvent) {
 window.addEventListener('keydown', handleKeydown);
 
 const beforeUnload = (event: BeforeUnloadEvent) => {
-  if (unresolvedCount.value > 0) {
+  if (unresolvedCount.value > 0 || reviewCount.value > 0) {
     event.preventDefault();
     event.returnValue = '';
   }
@@ -270,10 +295,30 @@ window.addEventListener('beforeunload', beforeUnload);
               <div class="stat-label">对齐句段</div>
             </div>
           </div>
-          <a-button long type="primary" status="success" style="margin-top: 12px" :disabled="!unresolvedCount" @click="acceptAll">
-            批量接受全部建议
+          <a-button
+            long
+            type="primary"
+            status="success"
+            style="margin-top: 12px"
+            :disabled="!notedPendingCount"
+            @click="confirmAcceptAll"
+          >
+            批量接受已填说明的改动（{{ notedPendingCount }}）
           </a-button>
+          <div style="margin-top: 6px; color: #86909c; font-size: 12px; line-height: 1.6">
+            只处理已填写校勘说明的改动，接受前需再次确认。
+          </div>
           <a-button long style="margin-top: 8px" @click="nextDifference">跳到下一处未接受差异</a-button>
+          <a-button
+            v-if="reviewCount"
+            long
+            type="outline"
+            status="warning"
+            style="margin-top: 8px"
+            @click="reviewVisible = true"
+          >
+            待复核 {{ reviewCount }} 条（重新对齐未能对应）
+          </a-button>
         </section>
 
         <section class="panel-section">
@@ -489,4 +534,62 @@ window.addEventListener('beforeunload', beforeUnload);
       <a-alert type="info" :show-icon="true">导入仅写入当前浏览器。对齐过程会分片执行，原文不会被自动改写。</a-alert>
     </a-form>
   </a-modal>
+
+  <a-drawer v-model:visible="reviewVisible" title="待复核校勘记录" :width="560" :footer="true">
+    <a-alert type="warning" :show-icon="true" style="margin-bottom: 12px">
+      以下记录来自上一次对齐，重新自动对齐后无法唯一对应到新结果。请对照当时的两侧原文和校记，逐条确认保留或放弃；全部处理完后才能导出校勘记。
+    </a-alert>
+
+    <a-empty v-if="!reviewRecords.length" description="没有待复核的记录，可以导出校勘记了" />
+
+    <a-card v-for="record in reviewRecords" :key="record.id" class="review-card" :bordered="true">
+      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px">
+        <a-tag :color="statusColor(record.status)">{{ statusLabel(record.status) }}</a-tag>
+        <a-tag v-if="record.accepted" size="small" color="green">当时已接受</a-tag>
+        <a-tag v-else size="small" color="orange">当时待处理</a-tag>
+        <span style="margin-left: auto; color: #86909c; font-size: 11px">
+          转入于 {{ new Date(record.createdAt).toLocaleString('zh-CN') }}
+        </span>
+      </div>
+
+      <div class="review-text-block">
+        <div class="paragraph-label">
+          底本<template v-if="record.left"> · 段 {{ record.left.paragraphOrder }} · 句 {{ record.left.sentenceOrder }}</template>
+        </div>
+        <div class="diff-text" :class="record.left ? 'removed' : 'same'">{{ record.left?.text || '（无对应底本句）' }}</div>
+      </div>
+      <div class="review-text-block">
+        <div class="paragraph-label">
+          参校本<template v-if="record.right"> · 段 {{ record.right.paragraphOrder }} · 句 {{ record.right.sentenceOrder }}</template>
+        </div>
+        <div class="diff-text" :class="record.right ? 'added' : 'same'">{{ record.right?.text || '（无对应参校本句）' }}</div>
+      </div>
+
+      <div style="margin-top: 10px; font-size: 12px; line-height: 1.7; color: #4e5969">
+        <div>校记：{{ record.note || '（未填写）' }}</div>
+        <div v-if="record.source" style="color: #86909c">来源：{{ record.source }}</div>
+      </div>
+
+      <div style="display: flex; gap: 8px; margin-top: 12px">
+        <a-button type="primary" size="small" @click="keepReviewRecord(record.id)">保留到对齐表</a-button>
+        <a-popconfirm content="确认放弃这条校勘记录？放弃后可通过撤销恢复。" @ok="discardReviewRecord(record.id)">
+          <a-button size="small" status="danger" type="outline">放弃</a-button>
+        </a-popconfirm>
+      </div>
+    </a-card>
+
+    <template #footer>
+      <div style="display: flex; align-items: center; gap: 12px">
+        <span style="color: #86909c; font-size: 12px">剩余 {{ reviewCount }} 条待复核</span>
+        <a-popconfirm
+          content="确认清空全部待复核记录？清空后可通过撤销恢复。"
+          ok-text="确认清空"
+          cancel-text="取消"
+          @ok="clearReviewRecords"
+        >
+          <a-button status="danger" :disabled="!reviewCount" style="margin-left: auto">清空待复核区</a-button>
+        </a-popconfirm>
+      </div>
+    </template>
+  </a-drawer>
 </template>

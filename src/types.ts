@@ -36,6 +36,18 @@ export interface ComparisonRules {
   candidateWindow: number;
 }
 
+export interface ReviewRecord {
+  id: string;
+  left?: TextUnit;
+  right?: TextUnit;
+  status: DifferenceStatus;
+  similarity: number;
+  note: string;
+  source: string;
+  accepted: boolean;
+  createdAt: string;
+}
+
 export interface PersistedCollationState {
   versions: VersionDocument[];
   leftVersionId: string;
@@ -43,4 +55,5 @@ export interface PersistedCollationState {
   rows: AlignmentRow[];
   rules: ComparisonRules;
   selectedRowId: string;
+  pendingReview?: ReviewRecord[];
 }
