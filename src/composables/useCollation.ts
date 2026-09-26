@@ -1,9 +1,10 @@
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref, toRaw, watch } from 'vue';
 import { sampleVersions, splitIntoUnits } from '../data';
 import type {
   AlignmentRow,
   ComparisonRules,
   DifferenceStatus,
+  PendingReviewItem,
   PersistedCollationState,
   TextUnit,
   VersionDocument
@@ -170,11 +171,79 @@ function defaultRules(): ComparisonRules {
   return { ignorePunctuation: true, ignoreVariants: true, candidateWindow: 3 };
 }
 
+function pairKey(row: AlignmentRow) {
+  return `${row.left?.id ?? '∅'}::${row.right?.id ?? '∅'}`;
+}
+
+function hasManualWork(row: AlignmentRow) {
+  return Boolean(
+    row.note.trim() || row.source.trim() || row.manuallyAdjusted || (row.accepted && row.status !== 'same')
+  );
+}
+
+function pendingKey(item: PendingReviewItem) {
+  return `${item.left?.id ?? '∅'}::${item.right?.id ?? '∅'}::${item.note}::${item.source}`;
+}
+
+function makeId(prefix: string) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function cloneUnit(unit: TextUnit): TextUnit {
+  return { ...toRaw(unit) };
+}
+
+function mergeManualWork(oldRows: AlignmentRow[], newRows: AlignmentRow[]) {
+  const countByKey = (list: AlignmentRow[]) => {
+    const counts = new Map<string, number>();
+    list.forEach((row) => counts.set(pairKey(row), (counts.get(pairKey(row)) ?? 0) + 1));
+    return counts;
+  };
+  const oldCounts = countByKey(oldRows);
+  const newCounts = countByKey(newRows);
+  const manualByKey = new Map<string, AlignmentRow[]>();
+  oldRows.filter(hasManualWork).forEach((row) => {
+    const list = manualByKey.get(pairKey(row)) ?? [];
+    list.push(row);
+    manualByKey.set(pairKey(row), list);
+  });
+
+  const used = new Set<AlignmentRow>();
+  let carried = 0;
+  const rows = newRows.map((row) => {
+    const key = pairKey(row);
+    const candidates = manualByKey.get(key);
+    if (candidates?.length === 1 && oldCounts.get(key) === 1 && newCounts.get(key) === 1) {
+      const old = candidates[0];
+      used.add(old);
+      carried += 1;
+      return { ...row, note: old.note, source: old.source, accepted: old.accepted };
+    }
+    return row;
+  });
+
+  const orphaned: PendingReviewItem[] = oldRows
+    .filter((row) => hasManualWork(row) && !used.has(row))
+    .map((row) => ({
+      id: makeId('review'),
+      left: row.left ? cloneUnit(row.left) : undefined,
+      right: row.right ? cloneUnit(row.right) : undefined,
+      status: row.status,
+      note: row.note,
+      source: row.source,
+      accepted: row.accepted,
+      manuallyAdjusted: row.manuallyAdjusted,
+      orphanedAt: new Date().toISOString()
+    }));
+  return { rows, carried, orphaned };
+}
+
 export function useCollation() {
   const versions = ref<VersionDocument[]>(clone(sampleVersions));
   const leftVersionId = ref(versions.value[0].id);
   const rightVersionId = ref(versions.value[1].id);
   const rows = ref<AlignmentRow[]>([]);
+  const pendingReview = ref<PendingReviewItem[]>([]);
   const rules = ref<ComparisonRules>(defaultRules());
   const selectedRowId = ref('');
   const selectedRowIds = ref<(string | number)[]>([]);
@@ -191,6 +260,9 @@ export function useCollation() {
   const differenceCount = computed(() => rows.value.filter((row) => row.status !== 'same').length);
   const acceptedCount = computed(() => rows.value.filter((row) => row.accepted).length);
   const unresolvedCount = computed(() => rows.value.filter((row) => !row.accepted && row.status !== 'same').length);
+  const notedAcceptableCount = computed(
+    () => rows.value.filter((row) => !row.accepted && row.status !== 'same' && row.note.trim()).length
+  );
 
   function snapshot(): string {
     const data: PersistedCollationState = {
@@ -199,7 +271,8 @@ export function useCollation() {
       rightVersionId: rightVersionId.value,
       rows: rows.value,
       rules: rules.value,
-      selectedRowId: selectedRowId.value
+      selectedRowId: selectedRowId.value,
+      pendingReview: pendingReview.value
     };
     return JSON.stringify(data);
   }
@@ -225,6 +298,7 @@ export function useCollation() {
     rows.value = parsed.rows;
     rules.value = parsed.rules;
     selectedRowId.value = parsed.selectedRowId;
+    pendingReview.value = parsed.pendingReview ?? [];
     persist();
   }
 
@@ -254,14 +328,21 @@ export function useCollation() {
       const result = await alignUnits(leftVersion.value.units, rightVersion.value.units, rules.value, (value) => {
         progress.value = value;
       });
+      const merged = mergeManualWork(rows.value, result);
+      const existing = new Set(pendingReview.value.map(pendingKey));
+      const fresh = merged.orphaned.filter((item) => !existing.has(pendingKey(item)));
       if (commitHistory) {
         history.value.push(previous);
         future.value = [];
       }
-      rows.value = result;
-      selectedRowId.value = result.find((row) => row.status !== 'same')?.id ?? result[0]?.id ?? '';
+      rows.value = merged.rows;
+      if (fresh.length) pendingReview.value = [...pendingReview.value, ...fresh];
+      selectedRowId.value = merged.rows.find((row) => row.status !== 'same')?.id ?? merged.rows[0]?.id ?? '';
       selectedRowIds.value = [];
-      message.value = `自动对齐完成：${result.filter((row) => row.status !== 'same').length} 处差异`;
+      const parts = [`自动对齐完成：${result.filter((row) => row.status !== 'same').length} 处差异`];
+      if (merged.carried) parts.push(`已带回 ${merged.carried} 条人工校勘`);
+      if (fresh.length) parts.push(`${fresh.length} 条旧记录进入待复核`);
+      message.value = parts.join('；');
       persist();
     } finally {
       processing.value = false;
@@ -336,11 +417,69 @@ export function useCollation() {
   }
 
   function acceptAll() {
-    commit('已批量接受全部差异建议', () => {
+    const targets = rows.value.filter((row) => !row.accepted && row.status !== 'same' && row.note.trim());
+    if (!targets.length) {
+      message.value = '没有已填写校勘说明的待接受改动';
+      return;
+    }
+    commit(`已批量接受 ${targets.length} 条已填说明的改动`, () => {
+      const selected = new Set(targets.map((row) => row.id));
       rows.value.forEach((row) => {
-        row.accepted = true;
+        if (selected.has(row.id)) row.accepted = true;
       });
       selectedRowIds.value = [];
+    });
+  }
+
+  function insertionIndexFor(item: PendingReviewItem) {
+    if (item.left) {
+      const index = rows.value.findIndex((row) => row.left && row.left.sentenceOrder > item.left!.sentenceOrder);
+      if (index !== -1) return index;
+    }
+    if (item.right) {
+      const index = rows.value.findIndex((row) => row.right && row.right.sentenceOrder > item.right!.sentenceOrder);
+      if (index !== -1) return index;
+    }
+    return rows.value.length;
+  }
+
+  function keepReviewItem(id: string) {
+    const item = pendingReview.value.find((entry) => entry.id === id);
+    if (!item) return;
+    commit('已将待复核记录保留回对齐表', () => {
+      pendingReview.value = pendingReview.value.filter((entry) => entry.id !== id);
+      const left = item.left ? cloneUnit(item.left) : undefined;
+      const right = item.right ? cloneUnit(item.right) : undefined;
+      const score =
+        left && right
+          ? Number(similarity(normalized(left.text, rules.value), normalized(right.text, rules.value)).toFixed(3))
+          : 0;
+      const row: AlignmentRow = {
+        id: makeId('row-kept'),
+        left,
+        right,
+        status: left && right ? statusFor(left, right, score) : left ? 'removed' : 'added',
+        similarity: score,
+        note: item.note,
+        source: item.source,
+        accepted: item.accepted,
+        manuallyAdjusted: true
+      };
+      rows.value.splice(insertionIndexFor(item), 0, row);
+      selectedRowId.value = row.id;
+    });
+  }
+
+  function discardReviewItem(id: string) {
+    commit('已放弃 1 条待复核记录', () => {
+      pendingReview.value = pendingReview.value.filter((entry) => entry.id !== id);
+    });
+  }
+
+  function clearReview() {
+    if (!pendingReview.value.length) return;
+    commit(`已清空 ${pendingReview.value.length} 条待复核记录`, () => {
+      pendingReview.value = [];
     });
   }
 
@@ -441,6 +580,7 @@ export function useCollation() {
     leftVersionId,
     rightVersionId,
     rows,
+    pendingReview,
     rules,
     selectedRowId,
     selectedRowIds,
@@ -457,6 +597,7 @@ export function useCollation() {
     differenceCount,
     acceptedCount,
     unresolvedCount,
+    notedAcceptableCount,
     runAlignment,
     recalculate,
     updateRow,
@@ -464,6 +605,9 @@ export function useCollation() {
     moveRow,
     acceptRows,
     acceptAll,
+    keepReviewItem,
+    discardReviewItem,
+    clearReview,
     nextDifference,
     addVersion,
     undo,

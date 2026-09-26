@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { Message } from '@arco-design/web-vue';
+import { Message, Modal } from '@arco-design/web-vue';
 import { statusLabel, useCollation } from './composables/useCollation';
 import type { AlignmentRow, DifferenceStatus } from './types';
 
@@ -9,6 +9,7 @@ const {
   leftVersionId,
   rightVersionId,
   rows,
+  pendingReview,
   rules,
   selectedRowId,
   selectedRowIds,
@@ -21,6 +22,7 @@ const {
   differenceCount,
   acceptedCount,
   unresolvedCount,
+  notedAcceptableCount,
   runAlignment,
   recalculate,
   updateRow,
@@ -28,6 +30,9 @@ const {
   moveRow,
   acceptRows,
   acceptAll,
+  keepReviewItem,
+  discardReviewItem,
+  clearReview,
   nextDifference,
   addVersion,
   undo,
@@ -38,6 +43,7 @@ const {
 } = useCollation();
 
 const importVisible = ref(false);
+const reviewVisible = ref(false);
 const onlyDifferences = ref(false);
 const rowQuery = ref('');
 const noteDraft = ref('');
@@ -79,6 +85,17 @@ watch(
   },
   { immediate: true }
 );
+
+watch(
+  () => pendingReview.value.length,
+  (now, before) => {
+    if (now > before) reviewVisible.value = true;
+  }
+);
+
+function formatTime(value: string) {
+  return new Date(value).toLocaleString('zh-CN');
+}
 
 function statusColor(status: DifferenceStatus) {
   return {
@@ -126,12 +143,26 @@ function download(filename: string, text: string, type: string) {
   URL.revokeObjectURL(url);
 }
 
-function handleExport(kind: 'markdown' | 'json') {
+function doExport(kind: 'markdown' | 'json') {
   if (kind === 'markdown') {
     download('校勘记.md', exportMarkdown(), 'text/markdown;charset=utf-8');
   } else {
     download('校勘数据.json', exportJson(), 'application/json;charset=utf-8');
   }
+}
+
+function handleExport(kind: 'markdown' | 'json') {
+  if (pendingReview.value.length) {
+    Modal.confirm({
+      title: '仍有待复核记录',
+      content: `还有 ${pendingReview.value.length} 条重新对齐前的旧记录未确认保留或放弃，建议先处理完再导出。确定现在导出吗？`,
+      okText: '仍然导出',
+      cancelText: '先去处理',
+      onOk: () => doExport(kind)
+    });
+    return;
+  }
+  doExport(kind);
 }
 
 function openImport() {
@@ -269,9 +300,26 @@ window.addEventListener('beforeunload', beforeUnload);
               <div class="stat-number">{{ rows.length }}</div>
               <div class="stat-label">对齐句段</div>
             </div>
+            <div class="stat-card">
+              <div class="stat-number" :style="pendingReview.length ? 'color: #0e42d2' : ''">{{ pendingReview.length }}</div>
+              <div class="stat-label">待复核</div>
+            </div>
           </div>
-          <a-button long type="primary" status="success" style="margin-top: 12px" :disabled="!unresolvedCount" @click="acceptAll">
-            批量接受全部建议
+          <a-button
+            long
+            type="primary"
+            status="success"
+            style="margin-top: 12px"
+            :disabled="!notedAcceptableCount"
+            @click="acceptAll"
+          >
+            批量接受已填说明的改动（{{ notedAcceptableCount }}）
+          </a-button>
+          <div style="margin-top: 6px; color: #86909c; font-size: 11px; line-height: 1.6">
+            批量接受只处理已填写校勘说明的改动，未填写的请逐条确认。
+          </div>
+          <a-button long style="margin-top: 8px" @click="reviewVisible = true">
+            待复核记录（{{ pendingReview.length }}）
           </a-button>
           <a-button long style="margin-top: 8px" @click="nextDifference">跳到下一处未接受差异</a-button>
         </section>
@@ -489,4 +537,54 @@ window.addEventListener('beforeunload', beforeUnload);
       <a-alert type="info" :show-icon="true">导入仅写入当前浏览器。对齐过程会分片执行，原文不会被自动改写。</a-alert>
     </a-form>
   </a-modal>
+
+  <a-drawer
+    v-model:visible="reviewVisible"
+    title="待复核记录 · 重新对齐前的旧记录"
+    :width="560"
+    :footer="false"
+  >
+    <template v-if="pendingReview.length">
+      <div class="review-toolbar">
+        <span>{{ pendingReview.length }} 条旧记录未能与新结果唯一对应</span>
+        <a-popconfirm
+          content="确定清空全部待复核记录？清空后仍可用撤销恢复。"
+          ok-text="确认清空"
+          cancel-text="再想想"
+          @ok="clearReview"
+        >
+          <a-button size="small" status="danger">清空待复核</a-button>
+        </a-popconfirm>
+      </div>
+      <a-alert type="info" :show-icon="true" style="margin-bottom: 12px">
+        仍可唯一对应的人工成果已自动带回新结果；以下记录请对照当时的两侧原文与校记，逐条确认保留或放弃，处理完后再导出。
+      </a-alert>
+      <div v-for="item in pendingReview" :key="item.id" class="review-item">
+        <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 8px">
+          <a-tag size="small" :color="statusColor(item.status)">{{ statusLabel(item.status) }}</a-tag>
+          <a-tag v-if="item.accepted" size="small" color="green">已接受</a-tag>
+          <a-tag v-else size="small" color="orange">待处理</a-tag>
+          <a-tag v-if="item.manuallyAdjusted" size="small" color="arcoblue">人工调整</a-tag>
+          <span style="margin-left: auto; color: #86909c; font-size: 11px">{{ formatTime(item.orphanedAt) }} 转入</span>
+        </div>
+        <div class="paragraph-label">
+          底本<template v-if="item.left"> · 段 {{ item.left.paragraphOrder }} · 句 {{ item.left.sentenceOrder }}</template>
+        </div>
+        <div class="diff-text same" style="min-height: 0">{{ item.left?.text || '（无对应底本句）' }}</div>
+        <div class="paragraph-label" style="margin-top: 8px">
+          参校本<template v-if="item.right"> · 段 {{ item.right.paragraphOrder }} · 句 {{ item.right.sentenceOrder }}</template>
+        </div>
+        <div class="diff-text changed" style="min-height: 0">{{ item.right?.text || '（无对应参校本句）' }}</div>
+        <div class="review-note">
+          <div>校记：{{ item.note || '（未填写）' }}</div>
+          <div v-if="item.source" style="margin-top: 4px; color: #86909c">来源：{{ item.source }}</div>
+        </div>
+        <div style="display: flex; gap: 8px; margin-top: 10px">
+          <a-button size="small" type="primary" @click="keepReviewItem(item.id)">保留回对齐表</a-button>
+          <a-button size="small" status="danger" @click="discardReviewItem(item.id)">放弃</a-button>
+        </div>
+      </div>
+    </template>
+    <a-empty v-else description="没有待复核的旧记录" />
+  </a-drawer>
 </template>
